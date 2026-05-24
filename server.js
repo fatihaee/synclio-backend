@@ -34,14 +34,12 @@ async function getChannels(m3uUrl) {
     const group = ch.group?.title || 'General'
     const groupLower = group.toLowerCase()
     const nameLower = name.toLowerCase()
-
     let type = 'tv'
     if (groupLower.includes('movie') || groupLower.includes('film') || groupLower.includes('cinema') || groupLower.includes('vod')) {
       type = 'movie'
     } else if (groupLower.includes('series') || groupLower.includes('show') || groupLower.includes('episode') || nameLower.includes('s0') || nameLower.includes('s1') || nameLower.includes('s2')) {
       type = 'series'
     }
-
     return {
       id: 'synclio_' + Buffer.from(name + i).toString('base64').slice(0, 16),
       name,
@@ -67,77 +65,5 @@ app.get('/:key/manifest.json', (req, res) => {
     resources: ['catalog', 'meta', 'stream'],
     types: ['tv', 'movie', 'series'],
     catalogs: [
-      {
-        type: 'tv',
-        id: 'synclio-live',
-        name: 'Live TV',
-        extra: [
-          { name: 'genre', isRequired: false },
-          { name: 'search', isRequired: false },
-          { name: 'skip', isRequired: false }
-        ]
-      },
-      {
-        type: 'movie',
-        id: 'synclio-movies',
-        name: 'Movies',
-        extra: [
-          { name: 'genre', isRequired: false },
-          { name: 'search', isRequired: false },
-          { name: 'skip', isRequired: false }
-        ]
-      },
-      {
-        type: 'series',
-        id: 'synclio-series',
-        name: 'Series',
-        extra: [
-          { name: 'genre', isRequired: false },
-          { name: 'search', isRequired: false },
-          { name: 'skip', isRequired: false }
-        ]
-      }
-    ],
-    behaviorHints: { configurable: false }
-  })
-})
-
-app.get('/:key/catalog/:type/:id.json', async (req, res) => {
-  const config = keys[req.params.key]
-  if (!config) return res.json({ metas: [] })
-  try {
-    let channels = await getChannels(config.m3uUrl)
-    const { type } = req.params
-    const { genre, search, skip } = req.query
-
-    channels = channels.filter(c => c.type === type)
-    if (genre) channels = channels.filter(c => c.group === genre)
-    if (search) channels = channels.filter(c =>
-      c.name.toLowerCase().includes(search.toLowerCase()))
-    if (skip) channels = channels.slice(Number(skip))
-
-    res.json({
-      metas: channels.map(ch => ({
-        id: ch.id,
-        type: ch.type,
-        name: ch.name,
-        poster: ch.logo,
-        background: ch.logo,
-        genres: [ch.group]
-      }))
-    })
-  } catch (e) {
-    console.error(e.message)
-    res.json({ metas: [] })
-  }
-})
-
-app.get('/:key/meta/:type/:id.json', async (req, res) => {
-  const config = keys[req.params.key]
-  if (!config) return res.json({ meta: null })
-  try {
-    const channels = await getChannels(config.m3uUrl)
-    const ch = channels.find(c => c.id === req.params.id)
-    if (!ch) return res.json({ meta: null })
-    res.json({
-      m
+      { type: 'tv', id: 'synclio-live', name: 'Live TV', extra: [{ name: 'genre', isRequired: false }, { name: 'search', isRequired: false }, { name: 'skip', isRequired: false }] },
+      { type: 'movie', id: 'synclio-movies', name: 'Movies', extra: [{ name: 'genre', isRequired: false
