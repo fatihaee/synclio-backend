@@ -6,6 +6,7 @@ const app = express()
 app.use(cors())
 app.use(express.json())
 const keys = {}
+const cache = {}
 function generateKey() {
   return Math.random().toString(36).substring(2, 10).toUpperCase()
 }
@@ -18,9 +19,12 @@ app.post('/api/generate-key', (req, res) => {
   res.json({ key, expiresAt })
 })
 async function getChannels(m3uUrl) {
+  if (cache[m3uUrl] && Date.now() - cache[m3uUrl].time < 5 * 60 * 1000) {
+    return cache[m3uUrl].data
+  }
   const resp = await axios.get(m3uUrl, { timeout: 15000, headers: { 'User-Agent': 'Mozilla/5.0' } })
   const result = PlaylistParser.parse(resp.data)
-  return result.items.map((ch, i) => {
+  const channels = result.items.map((ch, i) => {
     const name = ch.name || 'Channel ' + i
     const group = ch.group && ch.group.title ? ch.group.title : 'General'
     const groupLower = group.toLowerCase()
@@ -29,6 +33,8 @@ async function getChannels(m3uUrl) {
     else if (groupLower.includes('series') || groupLower.includes('show')) type = 'series'
     return { id: 'synclio_' + Buffer.from(name + i).toString('base64').slice(0, 16), name, logo: ch.tvg && ch.tvg.logo ? ch.tvg.logo : '', group, url: ch.url, type }
   })
+  cache[m3uUrl] = { data: channels, time: Date.now() }
+  return channels
 }
 app.get('/:key/manifest.json', (req, res) => {
   const config = keys[req.params.key]
