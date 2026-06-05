@@ -1,9 +1,9 @@
 const express = require('express')
-const cors = require('cors')
-const axios = require('axios')
-const fs = require('fs')
-const app = express()
+const cors    = require('cors')
+const axios   = require('axios')
+const fs      = require('fs')
 
+const app = express()
 app.use(cors())
 app.use(express.json())
 
@@ -17,78 +17,104 @@ function saveKeys() {
   fs.writeFileSync(KEYS_FILE, JSON.stringify(keys, null, 2))
 }
 
-// ─── In-memory caches ─────────────────────────────────────────────────────────
-const xtreamCache = {}      // Xtream API responses
-const tmdbCache = {}        // TMDB id → IMDB id mapping
-
 // ─── Config ───────────────────────────────────────────────────────────────────
-const TMDB_API_KEY = process.env.TMDB_API_KEY || ''   // Set in env for poster/IMDB matching
-const CACHE_TTL = 10 * 60 * 1000                      // 10 minutes
+const TMDB_API_KEY = process.env.TMDB_API_KEY || ''
+const PAGE_SIZE    = 100          // items sent per Stremio page request
+const CACHE_TTL    = 15 * 60 * 1000  // 15 min for full lists (they're large)
+const META_TTL     =  5 * 60 * 1000  // 5 min for individual item info
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-function generateKey() {
-  return Math.random().toString(36).substring(2, 10).toUpperCase()
-}
+// ─── Caches ───────────────────────────────────────────────────────────────────
+// xtreamCache  : raw Xtream API responses        { data, time }
+// tmdbCache    : tmdbId → imdbId (or null)
+// imdbIndex    : key → Map<imdbId, vodItem>      built once, reused
+// streamIndex  : key → Map<streamId, item>       for live/series lookups
+const xtreamCache = {}
+const tmdbCache   = {}
+const imdbIndex   = {}   // per-key reverse index  imdbId → vod item
+const streamIndex = {}   // per-key stream_id → item  (for meta lookups)
 
-function getConfig(key) {
-  const config = keys[key]
-  if (!config) return null
-  if (new Date() > new Date(config.expiresAt)) return null
-  return config
-}
-
-async function xtreamGet(server, username, password, action, extra = '') {
+// ─── Xtream fetch (with smart TTL) ───────────────────────────────────────────
+async function xtreamGet(server, username, password, action, extra = '', ttl = CACHE_TTL) {
   const cacheKey = `${server}|${action}|${extra}`
-  const cached = xtreamCache[cacheKey]
-  if (cached && Date.now() - cached.time < CACHE_TTL) return cached.data
+  const cached   = xtreamCache[cacheKey]
+  if (cached && Date.now() - cached.time < ttl) return cached.data
 
-  const url = `${server}/player_api.php?username=${username}&password=${password}&action=${action}${extra}`
-  const resp = await axios.get(url, {
-    timeout: 15000,
-    headers: { 'User-Agent': 'Mozilla/5.0' }
-  })
+  const url  = `${server}/player_api.php?username=${username}&password=${password}&action=${action}${extra}`
+  const resp = await axios.get(url, { timeout: 20000, headers: { 'User-Agent': 'Mozilla/5.0' } })
   xtreamCache[cacheKey] = { data: resp.data, time: Date.now() }
   return resp.data
 }
 
-/**
- * Convert a TMDB movie ID to an IMDB ID (tt-format).
- * Requires TMDB_API_KEY. Falls back to null if unavailable.
- */
+// ─── Key helpers ─────────────────────────────────────────────────────────────
+function generateKey() {
+  return Math.random().toString(36).substring(2, 10).toUpperCase()
+}
+function getConfig(key) {
+  const c = keys[key]
+  if (!c) return null
+  if (new Date() > new Date(c.expiresAt)) return null
+  return c
+}
+
+// ─── TMDB → IMDB (cached, single request per tmdbId) ─────────────────────────
 async function tmdbToImdb(tmdbId) {
   if (!TMDB_API_KEY || !tmdbId) return null
-
-  const cached = tmdbCache[tmdbId]
-  if (cached !== undefined) return cached   // can be null (meaning "not found")
-
+  if (tmdbId in tmdbCache) return tmdbCache[tmdbId]   // null is a valid cached value
   try {
-    const resp = await axios.get(
+    const { data } = await axios.get(
       `https://api.themoviedb.org/3/movie/${tmdbId}/external_ids`,
-      {
-        params: { api_key: TMDB_API_KEY },
-        timeout: 5000
-      }
+      { params: { api_key: TMDB_API_KEY }, timeout: 5000 }
     )
-    const imdbId = resp.data.imdb_id || null
-    tmdbCache[tmdbId] = imdbId
-    return imdbId
+    tmdbCache[tmdbId] = data.imdb_id || null
   } catch {
     tmdbCache[tmdbId] = null
-    return null
+  }
+  return tmdbCache[tmdbId]
+}
+
+// ─── Slim meta mapper (only fields Stremio needs for catalog rows) ────────────
+// We intentionally skip description/plot in catalog — it's huge and unused there.
+function vodToMeta(m, id) {
+  return {
+    id,
+    type:       'movie',
+    name:       m.name,
+    poster:     m.stream_icon || '',
+    background: m.stream_icon || '',
+    year:       m.year        || '',
+    genres:     [m.category_name || 'Movies']
   }
 }
 
-/**
- * Build the best Stremio ID for a VOD item.
- * If TMDB key available and movie has a tmdb field, convert to real IMDB id.
- * Otherwise use synclio_vod_ prefix.
- */
-async function buildMovieId(m) {
-  if (m.tmdb && TMDB_API_KEY) {
-    const imdbId = await tmdbToImdb(m.tmdb)
-    if (imdbId) return imdbId
+// ─── Build per-key IMDB index (lazy, only when TMDB_API_KEY is set) ───────────
+// We build the index for the whole list once, then all catalog pages use it.
+// Without TMDB_API_KEY we skip this and just use synclio_vod_ ids.
+async function ensureImdbIndex(key, allMovies) {
+  if (!TMDB_API_KEY) return
+  if (imdbIndex[key] && imdbIndex[key].built) return   // already done
+
+  // mark as in-progress to avoid duplicate builds on concurrent requests
+  if (!imdbIndex[key]) imdbIndex[key] = { map: new Map(), built: false, building: false }
+  if (imdbIndex[key].building) return
+  imdbIndex[key].building = true
+
+  // Fire TMDB lookups in small batches to avoid hammering the API
+  const BATCH = 20
+  for (let i = 0; i < allMovies.length; i += BATCH) {
+    const batch = allMovies.slice(i, i + BATCH)
+    await Promise.all(batch.map(async m => {
+      if (!m.tmdb) return
+      const imdbId = await tmdbToImdb(m.tmdb)
+      if (imdbId) imdbIndex[key].map.set(imdbId, m)
+    }))
   }
-  return `synclio_vod_${m.stream_id}_${m.container_extension || 'mkv'}`
+  imdbIndex[key].built    = true
+  imdbIndex[key].building = false
+}
+
+// Invalidate index when cache refreshes (call this if you ever bust the cache)
+function invalidateIndex(key) {
+  delete imdbIndex[key]
 }
 
 // ─── Key generation ───────────────────────────────────────────────────────────
@@ -97,11 +123,10 @@ app.post('/api/generate-key', (req, res) => {
   if (!server || !username || !password)
     return res.status(400).json({ error: 'server, username and password are required' })
 
-  const key = generateKey()
+  const key       = generateKey()
   const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000)
-  keys[key] = { server, username, password, expiresAt }
+  keys[key]       = { server, username, password, expiresAt }
   saveKeys()
-
   console.log('Key created:', key)
   res.json({ key, expiresAt })
 })
@@ -111,7 +136,6 @@ app.get('/:key/manifest.json', async (req, res) => {
   const config = getConfig(req.params.key)
   if (!config) return res.status(404).json({ error: 'Invalid or expired key' })
 
-  // Fetch category lists to expose genres to Stremio
   let movieGenres = [], seriesGenres = [], liveGenres = []
   try {
     const [mc, sc, lc] = await Promise.all([
@@ -122,41 +146,41 @@ app.get('/:key/manifest.json', async (req, res) => {
     movieGenres  = Array.isArray(mc) ? mc.map(c => c.category_name).filter(Boolean) : []
     seriesGenres = Array.isArray(sc) ? sc.map(c => c.category_name).filter(Boolean) : []
     liveGenres   = Array.isArray(lc) ? lc.map(c => c.category_name).filter(Boolean) : []
-  } catch { /* genres are optional */ }
+  } catch { /* genres are optional, don't crash */ }
 
   res.json({
-    id: 'com.synclio.' + req.params.key,
-    version: '1.0.0',
-    name: 'Synclio IPTV',
+    id:          'com.synclio.' + req.params.key,
+    version:     '1.0.0',
+    name:        'Synclio IPTV',
     description: 'Your personal IPTV in Stremio',
-    resources: ['catalog', 'meta', 'stream'],
-    types: ['tv', 'movie', 'series'],
+    resources:   ['catalog', 'meta', 'stream'],
+    types:       ['tv', 'movie', 'series'],
     catalogs: [
       {
         type: 'movie', id: 'synclio-movies', name: '🎬 Movies',
         genres: movieGenres,
         extra: [
-          { name: 'genre', isRequired: false },
+          { name: 'genre',  isRequired: false },
           { name: 'search', isRequired: false },
-          { name: 'skip', isRequired: false }
+          { name: 'skip',   isRequired: false }
         ]
       },
       {
         type: 'series', id: 'synclio-series', name: '📺 Series',
         genres: seriesGenres,
         extra: [
-          { name: 'genre', isRequired: false },
+          { name: 'genre',  isRequired: false },
           { name: 'search', isRequired: false },
-          { name: 'skip', isRequired: false }
+          { name: 'skip',   isRequired: false }
         ]
       },
       {
         type: 'tv', id: 'synclio-live', name: '📡 Live TV',
         genres: liveGenres,
         extra: [
-          { name: 'genre', isRequired: false },
+          { name: 'genre',  isRequired: false },
           { name: 'search', isRequired: false },
-          { name: 'skip', isRequired: false }
+          { name: 'skip',   isRequired: false }
         ]
       }
     ],
@@ -165,50 +189,60 @@ app.get('/:key/manifest.json', async (req, res) => {
 })
 
 // ─── MOVIES CATALOG ───────────────────────────────────────────────────────────
+// Strategy:
+//   1. Fetch ALL movies from Xtream (cached 15 min) — one network call
+//   2. Filter by genre/search in-memory
+//   3. Paginate with skip + PAGE_SIZE — Stremio will keep asking until empty
+//   4. Map to slim meta objects (no plot/description in catalog rows)
+//   5. IDs: real IMDB tt-ids when TMDB key present, otherwise synclio_vod_
 app.get('/:key/catalog/movie/synclio-movies.json', async (req, res) => {
   const config = getConfig(req.params.key)
   if (!config) return res.json({ metas: [] })
 
   try {
     const { genre, search, skip } = req.query
+    const skipN = Number(skip) || 0
 
-    let movies
-    if (genre) {
-      // Stremio passes the genre *name* — we need to look up the matching category_id
-      const categories = await xtreamGet(config.server, config.username, config.password, 'get_vod_categories')
-      const cat = Array.isArray(categories)
-        ? categories.find(c => c.category_name === genre)
-        : null
-      if (cat) {
-        movies = await xtreamGet(config.server, config.username, config.password, 'get_vod_streams', `&category_id=${cat.category_id}`)
-      } else {
-        movies = await xtreamGet(config.server, config.username, config.password, 'get_vod_streams')
-      }
-    } else {
-      movies = await xtreamGet(config.server, config.username, config.password, 'get_vod_streams')
-    }
-
+    // --- 1. Fetch all movies (cached) ---
+    let movies = await xtreamGet(config.server, config.username, config.password, 'get_vod_streams')
     if (!Array.isArray(movies)) return res.json({ metas: [] })
 
-    if (search) movies = movies.filter(m => m.name.toLowerCase().includes(search.toLowerCase()))
+    // --- 2. Filter ---
+    if (genre) {
+      const categories = await xtreamGet(config.server, config.username, config.password, 'get_vod_categories')
+      const cat = Array.isArray(categories) ? categories.find(c => c.category_name === genre) : null
+      if (cat) movies = movies.filter(m => String(m.category_id) === String(cat.category_id))
+    }
+    if (search) {
+      const q = search.toLowerCase()
+      movies = movies.filter(m => m.name.toLowerCase().includes(q))
+    }
 
-    const skipN = Number(skip) || 0
-    const page  = movies.slice(skipN, skipN + 200)
+    // --- 3. Paginate ---
+    const page = movies.slice(skipN, skipN + PAGE_SIZE)
+    if (page.length === 0) return res.json({ metas: [] })
 
-    // Build IDs — uses real IMDB ids when TMDB_API_KEY is set
-    const metas = await Promise.all(page.map(async m => {
-      const id = await buildMovieId(m)
-      return {
-        id,
-        type: 'movie',
-        name: m.name,
-        poster: m.stream_icon || '',
-        background: m.stream_icon || '',
-        year: m.year || '',
-        description: m.plot || '',
-        genres: [m.category_name || 'Movies']
+    // --- 4. Build IDs ---
+    // When TMDB key is available, start index build in background (non-blocking)
+    // For the current page, check if the index already has an entry, otherwise fallback id
+    if (TMDB_API_KEY && !imdbIndex[req.params.key]?.built) {
+      // kick off index build without awaiting — subsequent pages will benefit
+      ensureImdbIndex(req.params.key, movies).catch(() => {})
+    }
+
+    const idx = imdbIndex[req.params.key]?.map
+
+    const metas = page.map(m => {
+      let id
+      if (idx && m.tmdb) {
+        // check if we already resolved this item
+        const imdbId = tmdbCache[m.tmdb]
+        id = (imdbId && imdbId !== null) ? imdbId : `synclio_vod_${m.stream_id}_${m.container_extension || 'mkv'}`
+      } else {
+        id = `synclio_vod_${m.stream_id}_${m.container_extension || 'mkv'}`
       }
-    }))
+      return vodToMeta(m, id)
+    })
 
     res.json({ metas })
   } catch (e) {
@@ -224,37 +258,33 @@ app.get('/:key/catalog/series/synclio-series.json', async (req, res) => {
 
   try {
     const { genre, search, skip } = req.query
+    const skipN = Number(skip) || 0
 
-    let series
-    if (genre) {
-      const categories = await xtreamGet(config.server, config.username, config.password, 'get_series_categories')
-      const cat = Array.isArray(categories)
-        ? categories.find(c => c.category_name === genre)
-        : null
-      series = cat
-        ? await xtreamGet(config.server, config.username, config.password, 'get_series', `&category_id=${cat.category_id}`)
-        : await xtreamGet(config.server, config.username, config.password, 'get_series')
-    } else {
-      series = await xtreamGet(config.server, config.username, config.password, 'get_series')
-    }
-
+    let series = await xtreamGet(config.server, config.username, config.password, 'get_series')
     if (!Array.isArray(series)) return res.json({ metas: [] })
 
-    if (search) series = series.filter(s => s.name.toLowerCase().includes(search.toLowerCase()))
+    if (genre) {
+      const categories = await xtreamGet(config.server, config.username, config.password, 'get_series_categories')
+      const cat = Array.isArray(categories) ? categories.find(c => c.category_name === genre) : null
+      if (cat) series = series.filter(s => String(s.category_id) === String(cat.category_id))
+    }
+    if (search) {
+      const q = search.toLowerCase()
+      series = series.filter(s => s.name.toLowerCase().includes(q))
+    }
 
-    const skipN = Number(skip) || 0
-    const page  = series.slice(skipN, skipN + 200)
+    const page = series.slice(skipN, skipN + PAGE_SIZE)
+    if (page.length === 0) return res.json({ metas: [] })
 
     res.json({
       metas: page.map(s => ({
-        id: 'synclio_series_' + s.series_id,
-        type: 'series',
-        name: s.name,
-        poster: s.cover || '',
+        id:         'synclio_series_' + s.series_id,
+        type:       'series',
+        name:       s.name,
+        poster:     s.cover                   || '',
         background: s.backdrop_path?.[0] || s.cover || '',
-        year: s.year || '',
-        description: s.plot || '',
-        genres: [s.genre || 'Series']
+        year:       s.year                    || '',
+        genres:     [s.genre || 'Series']
       }))
     })
   } catch (e) {
@@ -270,44 +300,40 @@ app.get('/:key/catalog/tv/synclio-live.json', async (req, res) => {
 
   try {
     const { genre, search, skip } = req.query
+    const skipN = Number(skip) || 0
 
     let channels
+
     if (genre) {
-      // Genre filter: look up category_id by name
+      // Fetch only that category — fast
       const categories = await xtreamGet(config.server, config.username, config.password, 'get_live_categories')
-      const cat = Array.isArray(categories)
-        ? categories.find(c => c.category_name === genre)
-        : null
+      const cat = Array.isArray(categories) ? categories.find(c => c.category_name === genre) : null
       channels = cat
         ? await xtreamGet(config.server, config.username, config.password, 'get_live_streams', `&category_id=${cat.category_id}`)
         : await xtreamGet(config.server, config.username, config.password, 'get_live_streams')
-    } else if (search) {
-      // Search requires ALL channels — don't limit to first category
-      channels = await xtreamGet(config.server, config.username, config.password, 'get_live_streams')
     } else {
-      // Default: show first category only (avoids loading thousands of channels)
-      const categories = await xtreamGet(config.server, config.username, config.password, 'get_live_categories')
-      const firstCat = Array.isArray(categories) ? categories[0]?.category_id : null
-      channels = firstCat
-        ? await xtreamGet(config.server, config.username, config.password, 'get_live_streams', `&category_id=${firstCat}`)
-        : await xtreamGet(config.server, config.username, config.password, 'get_live_streams')
+      // No genre filter — fetch everything (cached), needed for search + full browse
+      channels = await xtreamGet(config.server, config.username, config.password, 'get_live_streams')
     }
 
     if (!Array.isArray(channels)) return res.json({ metas: [] })
 
-    if (search) channels = channels.filter(c => c.name.toLowerCase().includes(search.toLowerCase()))
+    if (search) {
+      const q = search.toLowerCase()
+      channels = channels.filter(c => c.name.toLowerCase().includes(q))
+    }
 
-    const skipN = Number(skip) || 0
-    const page  = channels.slice(skipN, skipN + 200)
+    const page = channels.slice(skipN, skipN + PAGE_SIZE)
+    if (page.length === 0) return res.json({ metas: [] })
 
     res.json({
       metas: page.map(c => ({
-        id: 'synclio_live_' + c.stream_id,
-        type: 'tv',
-        name: c.name,
-        poster: c.stream_icon || '',
+        id:         'synclio_live_' + c.stream_id,
+        type:       'tv',
+        name:       c.name,
+        poster:     c.stream_icon || '',
         background: c.stream_icon || '',
-        genres: [c.category_name || 'Live TV']
+        genres:     [c.category_name || 'Live TV']
       }))
     })
   } catch (e) {
@@ -324,72 +350,73 @@ app.get('/:key/meta/:type/:id.json', async (req, res) => {
   try {
     const { type, id } = req.params
 
-    // ── Movie ──
+    // ── Movie ──────────────────────────────────────────────────────────────────
     if (type === 'movie') {
 
       if (id.startsWith('synclio_vod_')) {
-        const parts  = id.replace('synclio_vod_', '').split('_')
-        const streamId = parts[0]
-        const info   = await xtreamGet(config.server, config.username, config.password, 'get_vod_info', `&vod_id=${streamId}`)
-        const m      = info.info || {}
+        const streamId = id.replace('synclio_vod_', '').split('_')[0]
+        const info     = await xtreamGet(config.server, config.username, config.password, 'get_vod_info', `&vod_id=${streamId}`, META_TTL)
+        const m        = info.info || {}
         return res.json({
           meta: {
             id,
-            type: 'movie',
-            name: m.name || id,
-            poster: m.movie_image || '',
-            background: m.backdrop_path || m.movie_image || '',
-            description: m.plot || '',
-            year: m.releasedate?.slice(0, 4) || '',
-            genres: [m.genre || 'Movies']
+            type:        'movie',
+            name:        m.name            || id,
+            poster:      m.movie_image     || '',
+            background:  m.backdrop_path   || m.movie_image || '',
+            description: m.plot            || '',
+            year:        m.releasedate?.slice(0, 4) || '',
+            genres:      [m.genre || 'Movies']
           }
         })
       }
 
       if (id.startsWith('tt')) {
-        // Real IMDB id — find matching VOD via TMDB reverse lookup
-        const allMovies = await xtreamGet(config.server, config.username, config.password, 'get_vod_streams')
-        if (!Array.isArray(allMovies)) return res.json({ meta: null })
+        // Use the index if it's ready; otherwise scan (this is a fallback)
+        const idx = imdbIndex[req.params.key]?.map
+        let match = idx?.get(id) || null
 
-        // Try to find a movie whose TMDB id maps to this IMDB id
-        let match = null
-        for (const m of allMovies) {
-          if (!m.tmdb) continue
-          const imdbId = await tmdbToImdb(m.tmdb)
-          if (imdbId === id) { match = m; break }
-        }
-
-        if (match) {
-          return res.json({
-            meta: {
-              id,
-              type: 'movie',
-              name: match.name,
-              poster: match.stream_icon || '',
-              background: match.stream_icon || '',
-              genres: [match.category_name || 'Movies']
+        if (!match) {
+          // index not ready — scan (slow path, rare after warmup)
+          const allMovies = await xtreamGet(config.server, config.username, config.password, 'get_vod_streams')
+          if (Array.isArray(allMovies)) {
+            for (const m of allMovies) {
+              if (!m.tmdb) continue
+              const imdbId = await tmdbToImdb(m.tmdb)
+              if (imdbId === id) { match = m; break }
             }
-          })
+          }
         }
-        return res.json({ meta: null })
+
+        if (!match) return res.json({ meta: null })
+        return res.json({
+          meta: {
+            id,
+            type:       'movie',
+            name:       match.name,
+            poster:     match.stream_icon || '',
+            background: match.stream_icon || '',
+            genres:     [match.category_name || 'Movies']
+          }
+        })
       }
     }
 
-    // ── Series ──
+    // ── Series ─────────────────────────────────────────────────────────────────
     if (type === 'series') {
       const seriesId = id.replace('synclio_series_', '')
-      const info     = await xtreamGet(config.server, config.username, config.password, 'get_series_info', `&series_id=${seriesId}`)
+      const info     = await xtreamGet(config.server, config.username, config.password, 'get_series_info', `&series_id=${seriesId}`, META_TTL)
       const s        = info.info || {}
 
       const videos = []
       if (info.episodes) {
-        for (const season of Object.keys(info.episodes)) {
+        for (const season of Object.keys(info.episodes).sort((a, b) => Number(a) - Number(b))) {
           for (const ep of info.episodes[season]) {
             videos.push({
-              id: `synclio_ep_${ep.id}_${ep.container_extension || 'mkv'}`,
-              title: ep.title || `Episode ${ep.episode_num}`,
-              season: Number(season),
-              episode: ep.episode_num,
+              id:       `synclio_ep_${ep.id}_${ep.container_extension || 'mkv'}`,
+              title:    ep.title || `Episode ${ep.episode_num}`,
+              season:   Number(season),
+              episode:  ep.episode_num,
               released: ep.added ? new Date(ep.added * 1000).toISOString() : ''
             })
           }
@@ -399,32 +426,37 @@ app.get('/:key/meta/:type/:id.json', async (req, res) => {
       return res.json({
         meta: {
           id,
-          type: 'series',
-          name: s.name || id,
-          poster: s.cover || '',
-          background: s.backdrop_path?.[0] || s.cover || '',
-          description: s.plot || '',
-          year: s.releaseDate?.slice(0, 4) || '',
-          genres: [s.genre || 'Series'],
+          type:        'series',
+          name:        s.name  || id,
+          poster:      s.cover || '',
+          background:  s.backdrop_path?.[0] || s.cover || '',
+          description: s.plot  || '',
+          year:        s.releaseDate?.slice(0, 4) || '',
+          genres:      [s.genre || 'Series'],
           videos
         }
       })
     }
 
-    // ── Live TV ──
+    // ── Live TV ────────────────────────────────────────────────────────────────
     const streamId = id.replace('synclio_live_', '')
-    const channels = await xtreamGet(config.server, config.username, config.password, 'get_live_streams')
-    const ch = Array.isArray(channels)
-      ? channels.find(c => String(c.stream_id) === String(streamId))
-      : null
+
+    // Use per-key stream index for O(1) lookup instead of scanning full list
+    if (!streamIndex[req.params.key]) {
+      const all = await xtreamGet(config.server, config.username, config.password, 'get_live_streams')
+      if (Array.isArray(all)) {
+        streamIndex[req.params.key] = new Map(all.map(c => [String(c.stream_id), c]))
+      }
+    }
+    const ch = streamIndex[req.params.key]?.get(String(streamId))
 
     return res.json({
       meta: {
         id,
-        type: 'tv',
-        name: ch?.name || id,
-        poster: ch?.stream_icon || '',
-        background: ch?.stream_icon || ''
+        type:       'tv',
+        name:       ch?.name         || id,
+        poster:     ch?.stream_icon  || '',
+        background: ch?.stream_icon  || ''
       }
     })
 
@@ -452,23 +484,25 @@ app.get('/:key/stream/:type/:id.json', async (req, res) => {
         url = `${config.server}/movie/${config.username}/${config.password}/${streamId}.${ext}`
 
       } else if (id.startsWith('tt')) {
-        // Real IMDB id — resolve to VOD via TMDB
-        const allMovies = await xtreamGet(config.server, config.username, config.password, 'get_vod_streams')
-        if (!Array.isArray(allMovies)) return res.json({ streams: [] })
+        const idx   = imdbIndex[req.params.key]?.map
+        let   match = idx?.get(id) || null
 
-        let match = null
-        for (const m of allMovies) {
-          if (!m.tmdb) continue
-          const imdbId = await tmdbToImdb(m.tmdb)
-          if (imdbId === id) { match = m; break }
+        if (!match) {
+          const allMovies = await xtreamGet(config.server, config.username, config.password, 'get_vod_streams')
+          if (Array.isArray(allMovies)) {
+            for (const m of allMovies) {
+              if (!m.tmdb) continue
+              const imdbId = await tmdbToImdb(m.tmdb)
+              if (imdbId === id) { match = m; break }
+            }
+          }
         }
 
         if (!match) {
           console.log('No VOD match for IMDB id:', id)
           return res.json({ streams: [] })
         }
-        const ext = match.container_extension || 'mkv'
-        url = `${config.server}/movie/${config.username}/${config.password}/${match.stream_id}.${ext}`
+        url = `${config.server}/movie/${config.username}/${config.password}/${match.stream_id}.${match.container_extension || 'mkv'}`
       }
 
     } else if (type === 'series') {
