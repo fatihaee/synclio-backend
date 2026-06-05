@@ -53,7 +53,7 @@ app.get('/:key/manifest.json', (req, res) => {
   })
 })
 
-// MOVIES CATALOG
+// MOVIES CATALOG - now fetches ALL movies and uses TMDB id when available
 app.get('/:key/catalog/movie/synclio-movies.json', async (req, res) => {
   const config = keys[req.params.key]
   if (!config) return res.json({ metas: [] })
@@ -63,26 +63,32 @@ app.get('/:key/catalog/movie/synclio-movies.json', async (req, res) => {
     if (genre) {
       movies = await xtreamGet(config.server, config.username, config.password, 'get_vod_streams', `&category_id=${genre}`)
     } else {
-      const categories = await xtreamGet(config.server, config.username, config.password, 'get_vod_categories')
-      const firstCat = categories[0]?.category_id
-      movies = await xtreamGet(config.server, config.username, config.password, 'get_vod_streams', `&category_id=${firstCat}`)
+      // Fetch ALL movies so nothing is missed
+      movies = await xtreamGet(config.server, config.username, config.password, 'get_vod_streams', '')
     }
+    if (!Array.isArray(movies)) return res.json({ metas: [] })
     if (search) movies = movies.filter(m => m.name.toLowerCase().includes(search.toLowerCase()))
     if (skip) movies = movies.slice(Number(skip))
     res.json({
-      metas: movies.slice(0, 100).map(m => ({
-        id: 'synclio_vod_' + m.stream_id,
-        type: 'movie',
-        name: m.name,
-        poster: m.stream_icon || '',
-        background: m.stream_icon || '',
-        year: m.year || '',
-        description: m.plot || '',
-        genres: [m.category_name || 'Movies']
-      }))
+      metas: movies.slice(0, 200).map(m => {
+        // Use TMDB id as stremio id when available — this lets Stremio match posters/metadata automatically
+        const stremioId = m.tmdb
+          ? 'tt' + m.tmdb
+          : 'synclio_vod_' + m.stream_id + '_' + (m.container_extension || 'mkv')
+        return {
+          id: stremioId,
+          type: 'movie',
+          name: m.name,
+          poster: m.stream_icon || '',
+          background: m.stream_icon || '',
+          year: m.year || '',
+          description: m.plot || '',
+          genres: [m.category_name || 'Movies']
+        }
+      })
     })
   } catch (e) {
-    console.error(e.message)
+    console.error('Movies catalog error:', e.message)
     res.json({ metas: [] })
   }
 })
@@ -97,14 +103,13 @@ app.get('/:key/catalog/series/synclio-series.json', async (req, res) => {
     if (genre) {
       series = await xtreamGet(config.server, config.username, config.password, 'get_series', `&category_id=${genre}`)
     } else {
-      const categories = await xtreamGet(config.server, config.username, config.password, 'get_series_categories')
-      const firstCat = categories[0]?.category_id
-      series = await xtreamGet(config.server, config.username, config.password, 'get_series', `&category_id=${firstCat}`)
+      series = await xtreamGet(config.server, config.username, config.password, 'get_series', '')
     }
+    if (!Array.isArray(series)) return res.json({ metas: [] })
     if (search) series = series.filter(s => s.name.toLowerCase().includes(search.toLowerCase()))
     if (skip) series = series.slice(Number(skip))
     res.json({
-      metas: series.slice(0, 100).map(s => ({
+      metas: series.slice(0, 200).map(s => ({
         id: 'synclio_series_' + s.series_id,
         type: 'series',
         name: s.name,
@@ -116,7 +121,7 @@ app.get('/:key/catalog/series/synclio-series.json', async (req, res) => {
       }))
     })
   } catch (e) {
-    console.error(e.message)
+    console.error('Series catalog error:', e.message)
     res.json({ metas: [] })
   }
 })
@@ -135,10 +140,11 @@ app.get('/:key/catalog/tv/synclio-live.json', async (req, res) => {
       const firstCat = categories[0]?.category_id
       channels = await xtreamGet(config.server, config.username, config.password, 'get_live_streams', `&category_id=${firstCat}`)
     }
+    if (!Array.isArray(channels)) return res.json({ metas: [] })
     if (search) channels = channels.filter(c => c.name.toLowerCase().includes(search.toLowerCase()))
     if (skip) channels = channels.slice(Number(skip))
     res.json({
-      metas: channels.slice(0, 100).map(c => ({
+      metas: channels.slice(0, 200).map(c => ({
         id: 'synclio_live_' + c.stream_id,
         type: 'tv',
         name: c.name,
@@ -148,7 +154,7 @@ app.get('/:key/catalog/tv/synclio-live.json', async (req, res) => {
       }))
     })
   } catch (e) {
-    console.error(e.message)
+    console.error('Live catalog error:', e.message)
     res.json({ metas: [] })
   }
 })
@@ -159,11 +165,25 @@ app.get('/:key/meta/:type/:id.json', async (req, res) => {
   if (!config) return res.json({ meta: null })
   try {
     const { type, id } = req.params
+
     if (type === 'movie') {
-      const streamId = id.replace('synclio_vod_', '')
-      const info = await xtreamGet(config.server, config.username, config.password, 'get_vod_info', `&vod_id=${streamId}`)
-      const m = info.info || {}
-      res.json({ meta: { id, type: 'movie', name: m.name || id, poster: m.movie_image || '', background: m.backdrop_path || m.movie_image || '', description: m.plot || '', year: m.releasedate?.slice(0, 4) || '', genres: [m.genre || 'Movies'] } })
+      if (id.startsWith('synclio_vod_')) {
+        const parts = id.replace('synclio_vod_', '').split('_')
+        const streamId = parts[0]
+        const info = await xtreamGet(config.server, config.username, config.password, 'get_vod_info', `&vod_id=${streamId}`)
+        const m = info.info || {}
+        return res.json({ meta: { id, type: 'movie', name: m.name || id, poster: m.movie_image || '', background: m.backdrop_path || m.movie_image || '', description: m.plot || '', year: m.releasedate?.slice(0, 4) || '', genres: [m.genre || 'Movies'] } })
+      } else if (id.startsWith('tt')) {
+        // TMDB id — find matching movie in provider
+        const allMovies = await xtreamGet(config.server, config.username, config.password, 'get_vod_streams', '')
+        const tmdbId = id.replace('tt', '')
+        const match = allMovies.find(m => String(m.tmdb) === String(tmdbId))
+        if (match) {
+          return res.json({ meta: { id, type: 'movie', name: match.name, poster: match.stream_icon || '', background: match.stream_icon || '' } })
+        }
+        return res.json({ meta: null })
+      }
+
     } else if (type === 'series') {
       const seriesId = id.replace('synclio_series_', '')
       const info = await xtreamGet(config.server, config.username, config.password, 'get_series_info', `&series_id=${seriesId}`)
@@ -172,18 +192,27 @@ app.get('/:key/meta/:type/:id.json', async (req, res) => {
       if (info.episodes) {
         Object.keys(info.episodes).forEach(season => {
           info.episodes[season].forEach(ep => {
-            videos.push({ id: 'synclio_ep_' + ep.id, title: ep.title || `Episode ${ep.episode_num}`, season: Number(season), episode: ep.episode_num, released: ep.added ? new Date(ep.added * 1000).toISOString() : '' })
+            videos.push({
+              id: 'synclio_ep_' + ep.id + '_' + (ep.container_extension || 'mkv'),
+              title: ep.title || `Episode ${ep.episode_num}`,
+              season: Number(season),
+              episode: ep.episode_num,
+              released: ep.added ? new Date(ep.added * 1000).toISOString() : ''
+            })
           })
         })
       }
-      res.json({ meta: { id, type: 'series', name: s.name || id, poster: s.cover || '', background: s.backdrop_path?.[0] || s.cover || '', description: s.plot || '', year: s.releaseDate?.slice(0, 4) || '', genres: [s.genre || 'Series'], videos } })
+      return res.json({ meta: { id, type: 'series', name: s.name || id, poster: s.cover || '', background: s.backdrop_path?.[0] || s.cover || '', description: s.plot || '', year: s.releaseDate?.slice(0, 4) || '', genres: [s.genre || 'Series'], videos } })
+
     } else {
       const streamId = id.replace('synclio_live_', '')
       const channels = await xtreamGet(config.server, config.username, config.password, 'get_live_streams', '')
       const ch = channels.find(c => String(c.stream_id) === String(streamId))
-      res.json({ meta: { id, type: 'tv', name: ch?.name || id, poster: ch?.stream_icon || '', background: ch?.stream_icon || '' } })
+      return res.json({ meta: { id, type: 'tv', name: ch?.name || id, poster: ch?.stream_icon || '', background: ch?.stream_icon || '' } })
     }
+
   } catch (e) {
+    console.error('Meta error:', e.message)
     res.json({ meta: null })
   }
 })
@@ -195,18 +224,43 @@ app.get('/:key/stream/:type/:id.json', async (req, res) => {
   try {
     const { type, id } = req.params
     let url
+
     if (type === 'movie') {
-      const streamId = id.replace('synclio_vod_', '')
-      url = `${config.server}/movie/${config.username}/${config.password}/${streamId}.mp4`
+      if (id.startsWith('synclio_vod_')) {
+        const parts = id.replace('synclio_vod_', '').split('_')
+        const streamId = parts[0]
+        const ext = parts[1] || 'mkv'
+        url = `${config.server}/movie/${config.username}/${config.password}/${streamId}.${ext}`
+      } else if (id.startsWith('tt')) {
+        // TMDB tt ID — search all VOD for matching movie
+        const allMovies = await xtreamGet(config.server, config.username, config.password, 'get_vod_streams', '')
+        const tmdbId = id.replace('tt', '')
+        const match = allMovies.find(m => String(m.tmdb) === String(tmdbId))
+        if (match) {
+          const ext = match.container_extension || 'mkv'
+          url = `${config.server}/movie/${config.username}/${config.password}/${match.stream_id}.${ext}`
+        } else {
+          console.log('No VOD match found for TMDB id:', tmdbId)
+          return res.json({ streams: [] })
+        }
+      }
+
     } else if (type === 'series') {
-      const epId = id.replace('synclio_ep_', '')
-      url = `${config.server}/series/${config.username}/${config.password}/${epId}.mp4`
+      const parts = id.replace('synclio_ep_', '').split('_')
+      const epId = parts[0]
+      const ext = parts[1] || 'mkv'
+      url = `${config.server}/series/${config.username}/${config.password}/${epId}.${ext}`
+
     } else {
       const streamId = id.replace('synclio_live_', '')
       url = `${config.server}/live/${config.username}/${config.password}/${streamId}.m3u8`
     }
+
+    console.log('Stream URL:', url)
     res.json({ streams: [{ url, title: 'Synclio Stream', behaviorHints: { notWebReady: false } }] })
+
   } catch (e) {
+    console.error('Stream error:', e.message)
     res.json({ streams: [] })
   }
 })
